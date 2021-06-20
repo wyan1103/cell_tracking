@@ -4,6 +4,12 @@ import matplotlib.pyplot as plt
 import math
 import random
 import sys
+import easygui
+
+# Print if debug flag is set
+def printd(text):
+    if DEBUG_PRINT:
+        print(text)
 
 '''
 Vector helper methods, where vectors are implemented as numpy arrays
@@ -25,6 +31,7 @@ class Vector:
 '''
 Represents a single tracked cell and its history, with functions to update the cell's position
 and direction based on new frames
+Note: Cell centers are converted to np arrays for easier calculations.
 '''
 class TrackedCell:
     MAX_FRAME_MISSES = 4
@@ -40,11 +47,15 @@ class TrackedCell:
         B = random.randint(128, 255)
         return (R,G,B)
 
-    def __init__(self, pos, avg_dir, frame_num):
-        self.pos = pos
-        self.dir = avg_dir
+    def __init__(self, pos, init_dir, init_size, frame_num):
+        self.pos = np.asarray(pos)
+        self.dir = init_dir
+        self.size = init_size
+
         self.pos_history = [(frame_num, pos)]
         self.dir_history = []
+        self.size_history = []
+
         self.misses = 0
         self.color = TrackedCell.gen_rand_cell_color()
         
@@ -53,18 +64,24 @@ class TrackedCell:
         TrackedCell.cell_total += 1
         TrackedCell.cell_nums.add(self.num)
 
-    def update_pos(self, new_pos, frame_num):
+    def update_pos(self, new_pos, new_size, frame_num):
+        new_pos = np.asarray(new_pos)
         self.dir = new_pos - self.pos
         self.pos = new_pos
+        self.size = new_size
+
         self.dir_history.append(self.dir)
+        self.size_history.append(self.size)
         self.pos_history.append((frame_num, new_pos))
+
         self.misses = 0
 
     def interp_pos(self, frame_num):
         self.dir = self.avg_dir_history()
         self.pos = self.pos + self.dir
-        self.dir_history.append(self.dir)
+
         self.pos_history.append((frame_num, self.pos))
+
         self.misses += 1
 
         if self.misses > TrackedCell.MAX_FRAME_MISSES:
@@ -86,6 +103,19 @@ class TrackedCell:
             avg //= past_records
             return avg.astype(np.int32)
 
+    def avg_size_history(self):
+        past_records = 5
+        if len(self.size_history) == 0:
+            return self.size
+        elif len(self.size_history) < past_records:
+            return np.mean(self.size_history, axis=0).astype(np.int32)
+        else:
+            avg = 0
+            for i in range(1, past_records + 1):
+                avg += self.size_history[-i]
+            avg //= past_records
+            return avg
+
     def __str__(self):
         return f'TrackedCell #{self.num}'
 
@@ -95,66 +125,101 @@ class TrackedCell:
 
 '''
 Keeps track of all cells given new frame centroids and frame numbers
+Note: Cell centers are represented as tuples to make them hashable.
 '''
 class CellTracker:
     NEW_CELL_FRAME_TOLERANCE = 4
     MAX_DST_ERROR = 1.5
     MAX_DIR_ERROR = math.pi / 6
+    CLUMP_MIN_AREA_INCREASE = 1.5
 
-    def __init__(self, initial_avg, frame_shape):
-        self.avg_dir = initial_avg
+    def __init__(self, initial_avg_dir, frame_shape):
+        self.avg_dir = initial_avg_dir
         self.tracked_cells = []
         self.tracked_cells_by_frame = []
         (self.frame_height, self.frame_width) = frame_shape
 
-    ''' Get all pairs of cells and centroids with their resulting distance/direction errors '''
-    def get_cell_centroid_errors(self, cell_centroids):
+    def get_pair_error(self, cell, cent):
+        predicted_dir = cell.avg_dir_history()
+        predicted_pos = cell.pos + predicted_dir
+        predicted_angle = Vector.angle(predicted_dir)
+        actual_angle = Vector.angle(cent - cell.pos)
+
+        dst_error = Vector.magnitude(cent - predicted_pos) 
+        dir_error = abs(predicted_angle - actual_angle)
+
+        return (dst_error, dir_error)
+
+
+    ''' Get all pairs of cells and centroids with their resulting distance/direction errors, sorted by error '''
+    def get_sorted_cell_centroid_errors(self, cell_centroids_areas):
         pairs = []
         for cell in self.tracked_cells:
-            for cent in cell_centroids:
+            for (cent, area) in cell_centroids_areas:
+                (dst_error, dir_error) = self.get_pair_error(cell, cent)
+
                 predicted_dir = cell.avg_dir_history()
-                predicted_pos = cell.pos + predicted_dir
-                predicted_angle = Vector.angle(predicted_dir)
-                actual_angle = Vector.angle(cent - cell.pos)
+                #predicted_pos = cell.pos + predicted_dir
+                #predicted_angle = Vector.angle(predicted_dir)
+                #actual_angle = Vector.angle(cent - cell.pos)
 
-                dst_error = Vector.magnitude(cent - predicted_pos) 
-                dir_error = abs(predicted_angle - actual_angle)
-
-                expected_dist = np.mean([Vector.magnitude(predicted_dir), Vector.magnitude(self.avg_dir)])
+                expected_dist = np.mean([Vector.magnitude([predicted_dir]), Vector.magnitude(self.avg_dir)])
 
                 max_dst_error = CellTracker.MAX_DST_ERROR 
                 max_dir_error = CellTracker.MAX_DIR_ERROR
+
+                major_axis = expected_dist * 3
+                minor_axis = expected_dist * 1
 
                 # If a cell is relatively new, relax the error bounds to account for abnormally fast cells
                 if len(cell.dir_history) < CellTracker.NEW_CELL_FRAME_TOLERANCE:
                     max_dst_error *= 2
 
                 if dst_error < expected_dist * max_dst_error and dir_error < max_dir_error:
-                    pairs.append((cell, cent, dst_error, dir_error))
+                    pairs.append((cell, cent, area, dst_error, dir_error))
         
-        return pairs
+        return sorted(pairs, key = lambda x: x[3] * x[4])
+
 
     ''' Match cells with centroids and update their position, returnning sets of matched cells and centroids '''
-    def update_tracked_cells(self, cell_centroids, frame_num):
-        # Get pairs of cells and centroids, sorted by error so we consider movements closest to our predictions
-        cell_centroid_pair_errors = self.get_cell_centroid_errors(cell_centroids)
-        cell_centroid_pair_errors = sorted(cell_centroid_pair_errors, key = lambda x: x[2] * x[3])
-
+    def update_tracked_cells(self, cell_centroids_areas, frame_num):
+        # Get pairs of cells and centroids and create sets to keep track of cells and centroids we have matched.
+        cell_centroid_pair_errors = self.get_sorted_cell_centroid_errors(cell_centroids_areas)
         updated_cells = set()
         updated_cents = set()
 
-        for (cell, cent, dst_error, dir_error) in cell_centroid_pair_errors:
-            if cell.num not in updated_cells and tuple(cent) not in updated_cents:
-                cell.update_pos(cent, frame_num)
+        potential_clumps = set()
+        clump_areas = dict()
+
+        for (cell, cent, cont_area, dst_error, dir_error) in cell_centroid_pair_errors:
+            if cell.num not in updated_cells:
+                if cent not in updated_cents:
+                    printd(f"Updating #{cell.num}")
+                    area = cont_area
+                elif cent in potential_clumps:
+                    printd(f"Updating Occluded #{cell.num}")
+                    area = clump_areas[cent]
+                    potential_clumps.remove(cent)
+                else:
+                    continue
+
+                cell_size = cell.avg_size_history()
+                if cell_size * CellTracker.CLUMP_MIN_AREA_INCREASE < area:
+                    potential_clumps.add(cent)
+                    clump_areas[cent] = area - cell_size
+                    cell.update_pos(cent, np.mean([cell.size, area]), frame_num)
+                else:
+                    cell.update_pos(cent, area, frame_num)
+
                 updated_cells.add(cell.num)
-                updated_cents.add(tuple(cent))
+                updated_cents.add(cent)
 
         return (updated_cells, updated_cents)
         
 
     ''' Track all unmatched cells by predicting their new location, untracking them if necessary '''
     def update_missing_cells(self, cells_tracked, frame_num):
-        false_positive_cells = []
+        cells_to_remove = []
         for cell in self.tracked_cells:
             if cell.num not in cells_tracked:
                 cell_missing = cell.interp_pos(frame_num)
@@ -162,34 +227,57 @@ class CellTracker:
 
                 # Stop tracking missing cells and cleanse them from tracker history
                 if cell_missing:
-                    self.tracked_cells.remove(cell)
+                    cells_to_remove.append(cell)
+                    printd(f"Removing: #{cell.num}")
                     for (fnum, prev_pos) in cell.pos_history[:-1]:
                         self.tracked_cells_by_frame[fnum].remove(cell)
 
                 # Stop tracking cells that have moved offscreen 
                 elif not (0 <= cx < self.frame_width and 0 <= cy < self.frame_height):
-                    self.tracked_cells.remove(cell)
+                    printd(f"Cell Finished: #{cell.num}")
+                    cells_to_remove.append(cell)
+                else:
+                    printd(f"Interpreting: #{cell.num}")
+
+        # Remove the cells in a separate loop to avoid messing up the original
+        for cell in cells_to_remove:
+            self.tracked_cells.remove(cell)
 
 
     ''' Add unmatched centroids as new tracked cells if they are in the first 1/4 of the frame '''
-    def add_new_cells(self, cell_centroids, centroids_matched, frame_num):
-        for cent in cell_centroids:
-            if tuple(cent) not in centroids_matched and \
+    def add_new_cells(self, cell_centroids_areas, centroids_matched, frame_num):
+        for (cent, area) in cell_centroids_areas:
+            if cent not in centroids_matched and \
                cent[0] < self.frame_width // 4:
-                self.tracked_cells.append(TrackedCell(cent, self.avg_dir, frame_num))
+                self.tracked_cells.append(TrackedCell(cent, self.avg_dir, area, frame_num))
+
+    ''' Get contour centroids from a list of contours '''
+    def get_centroids_with_areas(self, contours):
+        cell_centroids = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            M = cv2.moments(c)
+            cX = int(M['m10'] / M['m00'])
+            cY = int(M['m01'] / M['m00'])
+            centroid = (cX, cY)
+            cell_centroids.append((centroid, area))
+
+        return cell_centroids
 
     ''' Update tracked cells over the next frame using the given centroids '''
-    def update_tracker(self, cell_centroids, frame_num):
+    def update_tracker(self, cell_contours, frame_num):
+        cell_centroids_areas = self.get_centroids_with_areas(cell_contours)
+
         # If we are not tracking any cells, consider all centroids as cells
         if not self.tracked_cells:
-            for cent in cell_centroids:
-                self.tracked_cells.append(TrackedCell(cent, self.avg_dir, frame_num))
+            for (cent, area) in cell_centroids_areas:
+                self.tracked_cells.append(TrackedCell(cent, self.avg_dir, area, frame_num))
 
         # Otherwise interpret tracked cells new positions and add new ones if necessary
         else:
-            (updated_cells, updated_cents) = self.update_tracked_cells(cell_centroids, frame_num)
+            (updated_cells, updated_cents) = self.update_tracked_cells(cell_centroids_areas, frame_num)
             self.update_missing_cells(updated_cells, frame_num)
-            self.add_new_cells(cell_centroids, updated_cents, frame_num)
+            self.add_new_cells(cell_centroids_areas, updated_cents, frame_num)
 
         # Finally, update the tracker history and average cell displacement
         self.tracked_cells_by_frame.append(self.tracked_cells.copy())
@@ -288,40 +376,23 @@ class FrameProcessor:
 
         return cell_contours
 
-    ''' Get contour centroids from a list of contours '''
-    def get_centroids(self, contours):
-        cell_centroids = []
-        for c in contours:
-            M = cv2.moments(c)
-            cX = int(M['m10'] / M['m00'])
-            cY = int(M['m01'] / M['m00'])
-            cell_centroids.append(np.asarray([cX, cY]))
-
-        return cell_centroids
-
-    ''' Get contour centroids for the next frame in the video '''
-    def get_next_frame_centroids(self):
+    ''' Get cell contours from the next frame in the video '''
+    def get_next_frame_contours(self):
         success, frame = self.video.read()
         self.frame_num += 1
         if not success: 
             return False, None
         else:
+            cv2.imwrite(f'temp/zframe{self.frame_num}.jpg', frame)
             binary = self.get_binary(frame)
             contours = self.get_contours(binary)
-            centroids = self.get_centroids(contours)
             self.last_contour = contours
-            return True, centroids
-
-
+            return True, contours
 
 DEBUG = True
-if len(sys.argv) == 1:
-    path = "CellTrimFast2.avi"
-elif len(sys.argv) == 2:
-    path = sys.argv[1]
-else:
-    path = sys.argv[1]
-    DEBUG = True if sys.argv[2] == "-f" else False
+DEBUG_PRINT = False
+path = easygui.fileopenbox()
+print(path)
 
 if DEBUG:
     binary_frames = []
@@ -332,11 +403,12 @@ initial_avg_dir = np.asarray([50, 10])
 cell_tracker = CellTracker(initial_avg_dir, frame_processor.get_frame_shape())
 
 while(True):
-    success, cell_centroids = frame_processor.get_next_frame_centroids()
+    success, cell_contours = frame_processor.get_next_frame_contours()
+    printd(f"\n===== FRAME {frame_processor.frame_num} =====\n")
     if not success:
         break
     else:
-        cell_tracker.update_tracker(cell_centroids, frame_processor.frame_num)
+        cell_tracker.update_tracker(cell_contours, frame_processor.frame_num)
 
         # Output naive tracking frames (tracked cells before false positives are purged)
         if DEBUG:
@@ -389,4 +461,4 @@ if DEBUG:
         cv2.imwrite(f'temp/tracking{fnum}.jpg', tracking_img)
 
 print(TrackedCell.cell_total)
-print(TrackedCell.cell_nums)
+    
