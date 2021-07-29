@@ -1,0 +1,9 @@
+C:\Users\wy869\OneDrive\Desktop\Cytometer\CellTrim.avi
+
+Cell Count: 12
+
+Cells Fully Tracked: 6
+Cells Being Tracked: 6
+Cells Dropped: 5
+
+Time Taken: 12.530119180679321 seconds
