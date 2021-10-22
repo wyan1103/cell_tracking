@@ -1,8 +1,0 @@
-C:\Users\wy869\OneDrive\Desktop\Cytometer\CellTrimFast2.avi
-
-Cell Count: 41
-
-Cells Fully Tracked: 24
-Cells Being Tracked: 17Cells Dropped: 8
-
-Time Taken: 20.296152353286743 seconds

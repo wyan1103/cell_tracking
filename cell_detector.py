@@ -53,6 +53,7 @@ class TrackedCell:
         self.pos = np.asarray(pos)
         self.dir = init_dir
         self.size = init_size
+        self.age = 0
 
         self.pos_history = [(frame_num, pos)]
         self.dir_history = []
@@ -71,6 +72,7 @@ class TrackedCell:
         self.dir = new_pos - self.pos
         self.pos = new_pos
         self.size = new_size
+        self.age += 1
 
         self.dir_history.append(self.dir)
         self.size_history.append(self.size)
@@ -81,6 +83,7 @@ class TrackedCell:
     def interp_pos(self, frame_num):
         self.dir = self.avg_dir_history()
         self.pos = self.pos + self.dir
+        self.age += 1
 
         self.pos_history.append((frame_num, self.pos))
 
@@ -227,12 +230,16 @@ class CellTracker:
                     printd(f"Removing: #{cell.num}")
                     for (fnum, prev_pos) in cell.pos_history[:-1]:
                         self.cells_per_frame[fnum] -= 1
-                     #   self.tracked_cells_by_frame[fnum].remove(cell)
+                        self.tracked_cells_by_frame[fnum].remove(cell)
 
                 # Stop tracking cells that have moved offscreen 
                 elif not (0 <= cx < self.frame_width and 0 <= cy < self.frame_height):
-                    printd(f"Cell Finished: #{cell.num}")
                     cells_to_remove.append(cell)
+                    if cell.age < CellTracker.NEW_CELL_FRAME_TOLERANCE:
+                        for (fnum, prev_pos) in cell.pos_history[:-1]:
+                            assert(cell in self.tracked_cells_by_frame[fnum])
+                            self.cells_per_frame[fnum] -= 1
+                            self.tracked_cells_by_frame[fnum].remove(cell)
                 else:
                     printd(f"Interpreting: #{cell.num}")
 
@@ -278,7 +285,7 @@ class CellTracker:
 
         # Finally, update the tracker history and average cell displacement
         self.cells_per_frame.append(len(self.tracked_cells))
-        #self.tracked_cells_by_frame.append(self.tracked_cells.copy())
+        self.tracked_cells_by_frame.append(self.tracked_cells.copy())
         if len(self.tracked_cells) != 0:
             new_avg = np.asarray([0,0], dtype=np.int32)
             for cell in self.tracked_cells:
@@ -291,7 +298,8 @@ Processes frames from a video to extract centroid locations of potential cells
 '''
 
 class FrameProcessor:
-    NUM_BG_FRAMES = 10
+    NUM_BG_FRAMES = 5
+    BG_REORIENT_RATE = 1
     CONTOUR_MIN_AREA = 80
 
     @staticmethod
@@ -299,7 +307,7 @@ class FrameProcessor:
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     def __init__(self, video_path):
-        self.totDif = self.totDst = self.totTsh = self.totRem = 0
+        self.tot1 = self.tot2 = self.tot3 = self.tot4 = 0
         self.video = cv2.VideoCapture(video_path)
         success, frame = self.video.read()
         if not success:
@@ -308,7 +316,7 @@ class FrameProcessor:
 
         gray = FrameProcessor.grayscale(frame)
         self.background_frames = [gray]
-        self.background_avg = gray.astype(np.float64)
+        self.background_avg = gray.astype(np.uint8)
         self.frame_num = -1  # frames indexed from 0, first is ignored
 
         self.last_binary = None
@@ -333,52 +341,58 @@ class FrameProcessor:
                   when looking at difference frames, leading to elongated cell shapes.
     '''
     def get_binary(self, frame):
-        gray = FrameProcessor.grayscale(frame)
+        t1 = t2 = t3 = t4 = t5 = t6 = t7 = t8 = 0
 
         t1 = time.time()
 
-        tmp = np.asarray(self.background_frames)
-
-        t2 = time.time()
-
-        # Look at the difference between the frame foreground and an averaged background
-        avg_background = np.average(tmp, axis=0)
+        gray = FrameProcessor.grayscale(frame)
 
         t3 = time.time()
 
-        diff_frame = np.clip(gray - avg_background, 0, 255)
+        avg_background = sum(self.background_frames) // len(self.background_frames)
+        avg_background = avg_background.astype(np.uint8)
 
-        #diff_frame = np.clip(d, 0, 255, out=growth)
-
+        diff_frame = cv2.absdiff(avg_background, gray)
+        
         t4 = time.time()
 
-        diff_frame = np.abs(diff_frame - np.mean(diff_frame))
-
-
         # Distance transform to reduce noise, normalize to 0-255 
-        dist = cv2.distanceTransform(diff_frame.astype(np.uint8), cv2.DIST_L2, 3).astype(np.uint8)
-        dist = cv2.medianBlur(dist, 5)
+        #cv2.distanceTransform(diff_frame.astype(np.uint8), cv2.DIST_L2, 3).astype(np.uint8)
+        dist = cv2.medianBlur(diff_frame, 5)
         normalized_dist = cv2.normalize(dist, np.zeros_like(dist), 0, 255, cv2.NORM_MINMAX)
 
         # Finally threshold and perform morphological operations to clean up holes and noise
-        _, binary = cv2.threshold(normalized_dist, 4, 255, cv2.THRESH_BINARY)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8, 3))
+        _, binary = cv2.threshold(normalized_dist, 96, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8, 8))
         binary = cv2.dilate(binary, kernel, iterations=3)
         binary = cv2.erode(binary, kernel, iterations=3)
 
-        t5 = time.time()
+        t2 = time.time()
 
-        self.totDif += t2 - t1
-        self.totDst += t3 - t2
-        self.totTsh += t4 - t3
-        self.totRem += t5 - t4
+        self.tot1 += t2 - t1
+        self.tot2 += t4 - t3
+        self.tot3 += t6 - t5
+        self.tot4 += t8 - t7
 
         # Add current frame to a sliding window of background frames
         
         self.background_frames.insert(0, gray)
         if len(self.background_frames) > FrameProcessor.NUM_BG_FRAMES:
             last = self.background_frames.pop()
-
+        '''
+        n = len(self.background_frames)
+        if n < FrameProcessor.NUM_BG_FRAMES:
+            self.background_frames.insert(0, gray)
+            self.background_avg = self.background_avg + (gray - self.background_avg) // n
+        else:
+            last = self.background_frames.pop().astype(np.int8)
+            self.background_frames.insert(0, gray)
+            if n % FrameProcessor.BG_REORIENT_RATE == 0:
+                self.background_avg = np.average(self.background_frames, axis=0).astype(np.int8)
+            else:
+                self.background_avg -= last // FrameProcessor.NUM_BG_FRAMES
+                self.background_avg += gray // FrameProcessor.NUM_BG_FRAMES
+        '''
         self.last_binary = binary
         return binary
 
@@ -386,7 +400,7 @@ class FrameProcessor:
     def get_contours(self, binary):
         contours, _ = cv2.findContours(binary.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cell_contours = filter(lambda c: cv2.contourArea(c) >= FrameProcessor.CONTOUR_MIN_AREA, contours)
-        cell_contours = list(cell_contours)\
+        cell_contours = list(cell_contours)
 
         if DEBUG:
             contour_img = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
@@ -450,7 +464,7 @@ while(True):
         totTimeTR += time.time() - startTime
 
         # Output naive tracking frames (tracked cells before false positives are purged)
-        if False: #DEBUG:
+        if DEBUG:
             contour_frame = frame_processor.get_last_contour()
             for cell in cell_tracker.tracked_cells:
                 p1 = p2 = None
@@ -469,7 +483,7 @@ while(True):
                     contour_frame = cv2.putText(contour_frame, str(cell.num), tuple(p2), cv2.FONT_HERSHEY_SIMPLEX, 1, cell.color, 2)
             
             cv2.imwrite(f'temp/initial_tracking{frame_processor.frame_num}.jpg', contour_frame)
-    bar.update(frame_processor.frame_num)
+    #bar.update(frame_processor.frame_num)
 
 # Create output directory if one doesn't exist
 if not os.path.isdir("output/"):
@@ -486,10 +500,11 @@ plt.savefig('output/plot.png')
 
 # Generate tracking frames
 if DEBUG:
-    print(len(cell_tracker.tracked_cells_by_frame))
+    cellnums = set()
     for (fnum, t) in enumerate(cell_tracker.tracked_cells_by_frame):
         tracking_img = binary_frames[fnum]
         for cell in t:
+            cellnums.add(cell.num)
             for i in range(1, len(cell.pos_history)):
                 (f1, p1) = cell.pos_history[i-1]
                 (f2, p2) = cell.pos_history[i]
@@ -504,7 +519,7 @@ if DEBUG:
             
 
         cv2.imwrite(f'temp/tracking{fnum}.jpg', tracking_img)
-
+    print(cellnums)
 end_time = time.time()
 time_taken = end_time - start_time
 
@@ -527,7 +542,9 @@ print("WRITE TIME: " + str(totTimeWR))
 print("FRAME TIME: " + str(totTimeFP))
 print("TRACKING TIME: " + str(totTimeTR))
 
-print(frame_processor.totDif)
-print(frame_processor.totDst)
-print(frame_processor.totTsh)
-print(frame_processor.totRem)
+print(frame_processor.tot1)
+print(frame_processor.tot2)
+print(frame_processor.tot3)
+print(frame_processor.tot4)
+
+print(f"\nTRACKED: {fully_tracked}")
