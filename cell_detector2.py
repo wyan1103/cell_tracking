@@ -464,7 +464,7 @@ while(True):
                     f1, p1 = cell.pos_history[i]
                     f2, p2 = cell.pos_history[i+1]
                     contour_frame = cv2.circle(contour_frame, tuple(p1), 5, cell.color, -1)
-                    contour_frame = cv2.line(contour_frame, p1, p2, cell.color, 3)
+                    contour_frame = cv2.line(contour_frame, tuple(p1), tuple(p2), cell.color, 3)
                     
                 if p2 is None:
                     f1, p1 = cell.pos_history[0]
